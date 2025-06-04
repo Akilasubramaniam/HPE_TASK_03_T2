@@ -1,17 +1,16 @@
 import pandas as pd
 import os
 
-# Load file
+# === Load file ===
 input_file = "6mo_KPI_Prophet_forecast.csv"
 if not os.path.exists(input_file):
-    print(f"File not found: {input_file}")
+    print(f" File not found: {input_file}")
     exit()
 
-# Read and clean
 df = pd.read_csv(input_file)
 df.columns = [col.strip().replace(" ", "_") for col in df.columns]
 
-# Rename columns if needed
+# === Rename columns if needed ===
 rename_map = {}
 if "DL_Prb_Utilization" not in df.columns:
     for col in df.columns:
@@ -27,55 +26,49 @@ for col in required_cols:
         print(f" Missing column: {col}")
         exit()
 
-# Format and sort
+# === Format columns ===
 df['Timestamp'] = pd.to_datetime(df['Timestamp'])
 df = df.sort_values(by=['NCI', 'Timestamp'])
 
-# Ensure numeric values
 df['DL_Prb_Utilization'] = pd.to_numeric(df['DL_Prb_Utilization'], errors='coerce')
 df['Avg_UE_Number'] = pd.to_numeric(df['Avg_UE_Number'], errors='coerce')
 
-# Mode thresholds
+# === Thresholds ===
 modes = {
     "Conservative": {"DL_Prb_Utilization": 10, "Avg_UE_Number": 10},
     "Moderate": {"DL_Prb_Utilization": 15, "Avg_UE_Number": 13},
     "Aggressive": {"DL_Prb_Utilization": 20, "Avg_UE_Number": 17}
 }
 
-# Function to identify shutdown windows
-def find_shutdown_windows(group, max_prb, max_ue, min_len=30):
+# === Find valid 30-min  or more windows ===
+def filter_shutdown_rows(group, max_prb, max_ue):
     group = group.copy()
-    mask = (group["DL_Prb_Utilization"] <= max_prb) & (group["Avg_UE_Number"] <= max_ue)
-    group["valid"] = mask.astype(int)
+    group["valid"] = (group["DL_Prb_Utilization"] <= max_prb) & (group["Avg_UE_Number"] <= max_ue)
     group["segment"] = (group["valid"] != group["valid"].shift()).cumsum()
 
-    windows = []
-    for _, segment_df in group[group["valid"] == 1].groupby("segment"):
-        if len(segment_df) >= min_len:
-            start = segment_df["Timestamp"].iloc[0]
-            end = segment_df["Timestamp"].iloc[min_len - 1]  # exactly 30 min duration
-            windows.append({
-                "Start_Timestamp": start,
-                "End_Timestamp": end,
-                "NCI": segment_df["NCI"].iloc[0],
-                "Duration_Minutes": 30  # fixed
-            })
-    return windows
+    valid_rows = []
+    for seg_val, seg_df in group.groupby("segment"):
+        if seg_df["valid"].iloc[0] and len(seg_df) >= 2:  # 2 x 15min = 30min
+            valid_rows.append(seg_df)
 
-# Apply for all modes
+    if valid_rows:
+        return pd.concat(valid_rows)
+    else:
+        return pd.DataFrame(columns=group.columns)
+
+# === Loop over modes ===
 for mode, limits in modes.items():
-    all_shutdowns = []
-    for nci, group in df.groupby("NCI"):
-        shutdowns = find_shutdown_windows(
-            group,
-            limits["DL_Prb_Utilization"],
-            limits["Avg_UE_Number"],
-            min_len=15
-        )
-        all_shutdowns.extend(shutdowns)
+    mode_filtered = []
+    for nci, nci_group in df.groupby("NCI"):
+        filtered = filter_shutdown_rows(nci_group, limits["DL_Prb_Utilization"], limits["Avg_UE_Number"])
+        if not filtered.empty:
+            mode_filtered.append(filtered)
 
-    result_df = pd.DataFrame(all_shutdowns)
-    output_file = f"{mode.lower()}_mode_shutdown_windows.csv"
-    result_df.to_csv(output_file, index=False)
-    print(f" {mode} mode → Found {len(result_df)} shutdown windows")
-    print(f" Saved to {output_file}")
+    if mode_filtered:
+        final_df = pd.concat(mode_filtered)
+    else:
+        final_df = pd.DataFrame(columns=df.columns)
+
+    out_csv = f"{mode.lower()}_mode_shutdown_rows.csv"
+    final_df.to_csv(out_csv, index=False)
+    print(f" {mode} → {len(final_df)} rows written to {out_csv}")
